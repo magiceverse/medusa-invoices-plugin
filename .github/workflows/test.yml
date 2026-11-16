@@ -18,7 +18,7 @@ jobs:
           - 22
           - 24
 
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, linux, x64, light]
 
     steps:
       - uses: actions/checkout@v4
@@ -40,7 +40,7 @@ jobs:
           - 22
           - 24
 
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, linux, x64, light]
 
     steps:
       - uses: actions/checkout@v4
@@ -69,36 +69,22 @@ jobs:
           - version: "2.13.1"
             swc-core: "1.7.42"
 
-    runs-on: ubuntu-22.04
-
-    services:
-      redis:
-        image: redis:7
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 6379:6379
-
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: ""
-          POSTGRES_USER: postgres
-          POSTGRES_DB: medusa_test
-          POSTGRES_HOST_AUTH_METHOD: trust
-        options: >-
-          --health-cmd "pg_isready -U postgres -d medusa_test"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
+    runs-on: [self-hosted, linux, x64, ci]
 
     steps:
       - uses: actions/checkout@v4
+      - name: Start Redis and Postgres next to the job
+        run: |
+          # `services:` would publish ports on the host's Docker daemon (the runner is itself a container on it): parallel jobs would clash on 5432/6379
+          # and the ports would not be localhost for the job. The services share the network namespace of this runner container instead.
+          redis="svc-redis-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ strategy.job-index }}"
+          pg="svc-pg-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ strategy.job-index }}"
+          echo "SVC_REDIS=$redis" >> "$GITHUB_ENV"
+          echo "SVC_PG=$pg" >> "$GITHUB_ENV"
+          docker run -d --name "$redis" --network "container:$(hostname)" redis:7 >/dev/null
+          docker run -d --name "$pg" --network "container:$(hostname)" \
+            -e POSTGRES_USER=postgres -e POSTGRES_DB=medusa_test -e POSTGRES_HOST_AUTH_METHOD=trust postgres:16 >/dev/null
+          timeout 120 bash -c "until docker exec $redis redis-cli ping >/dev/null 2>&1 && docker exec $pg pg_isready -U postgres -d medusa_test >/dev/null 2>&1; do sleep 2; done"
       - name: Enable Corepack
         run: corepack enable
       - name: Use Node.js ${{ matrix.node-version }}
@@ -123,3 +109,6 @@ jobs:
       - run: yarn test:integration:modules
         env:
           DB_TEMP_NAME: medusa_test
+      - name: Remove Redis and Postgres
+        if: always()
+        run: docker rm -f "$SVC_REDIS" "$SVC_PG" >/dev/null 2>&1 || true
